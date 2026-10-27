@@ -9,8 +9,8 @@ importers:
   .:
     dependencies:
       cf-nix-cache:
-        specifier: 0.1.0
-        version: 0.1.0
+        specifier: 0.1.1
+        version: 0.1.1
     devDependencies:
       '@types/node':
         specifier: 24.13.3
@@ -583,8 +583,8 @@ packages:
   blake3-wasm@2.1.5:
     resolution: {integrity: sha512-F1+K8EbfOZE49dtoPtmxUQrpXaBIl3ICvasLh+nJta0xkz+9kF/7uet9fLnwKqhDrmj6g+6K3Tw9yQPUg2ka5g==}
 
-  cf-nix-cache@0.1.0:
-    resolution: {integrity: sha512-TxrGKf5GA1a+V5JJNx7FCM0YZYeQc9jR9sP6JZiR7eMjOl2rmxKepq/1o/7zY+SqKteNzmJ7ocQYnPqzSbVHGA==}
+  cf-nix-cache@0.1.1:
+    resolution: {integrity: sha512-Pfpa01zbtc8N5C9m7LAHkg77nKEF5GX7HJ90u78n8QI27t8ThCQQgp0t9OkQJOcDJB7A44Pr2BHhHeq+IchmWQ==}
     engines: {node: '>=20'}
 
   cookie@1.1.1:
@@ -1029,7 +1029,7 @@ snapshots:
 
   blake3-wasm@2.1.5: {}
 
-  cf-nix-cache@0.1.0: {}
+  cf-nix-cache@0.1.1: {}
 
   cookie@1.1.1: {}
 
