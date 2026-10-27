@@ -4,12 +4,16 @@ import { readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { stripVTControlCharacters } from "node:util";
 
 export const templateDirectory = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   "..",
 );
 export const configPath = path.join(templateDirectory, "wrangler.jsonc");
+// Rendered configs are written beside wrangler.jsonc; keep in sync with
+// .gitignore.
+const renderedConfigPrefix = ".wrangler-rendered-";
 
 export const secretNames = [
   "AUTH_PRIVATE_JWK",
@@ -263,10 +267,12 @@ export async function renderedConfig(image: string): Promise<string> {
   validateConfig(config, image);
   const containers = processorContainers(config);
   for (const container of containers) container.image = image;
+  // The rendered file sits beside wrangler.jsonc so that every relative path
+  // in the customer config (main, $schema, assets, rules, tsconfig) resolves
+  // exactly as it does for the source config.
   const output = path.join(
     templateDirectory,
-    ".wrangler",
-    `cf-nix-cache-${process.pid}-${randomUUID()}.json`,
+    `${renderedConfigPrefix}${process.pid}-${randomUUID()}.json`,
   );
   await writeFile(output, `${JSON.stringify(config, null, 2)}\n`, {
     mode: 0o600,
@@ -307,8 +313,14 @@ export function nixPublicKey(
   return `${name}:${Buffer.from(jwk.x, "base64url").toString("base64")}`;
 }
 
+// Wrangler reports a missing script as `Worker "<name>" not found.`; older
+// releases surface the raw API error code 10007 instead.
+const workerNotFound =
+  /Worker "[^"]+"(?: \(env: [^)]+\))? not found\.|\[code: 10007\]/;
+
 export async function secretNamesFromWrangler(
   config: string,
+  options: { allowMissingWorker?: boolean } = {},
 ): Promise<Set<string>> {
   const result = await wrangler(
     ["secret", "list", "--format", "json"],
@@ -318,7 +330,18 @@ export async function secretNamesFromWrangler(
     },
     config,
   );
-  if (result.status !== 0) return new Set();
+  if (result.status !== 0) {
+    const output = `${result.stdout}\n${result.stderr}`;
+    // Only an explicit "Worker not found" before the first deployment means
+    // that no secrets exist. Any other failure (authentication, network, API)
+    // must never be mistaken for an empty set, which would regenerate keys.
+    if (options.allowMissingWorker && workerNotFound.test(output))
+      return new Set();
+    process.stderr.write(output);
+    fail(
+      `wrangler secret list failed with exit code ${result.status}; refusing to continue without a reliable secret inventory`,
+    );
+  }
   try {
     const parsed = JSON.parse(result.stdout) as
       Array<{ name?: string }> | { secrets?: Array<{ name?: string }> };
@@ -355,86 +378,100 @@ export function bucketName(config: TemplateConfig): string {
   return bucket ?? fail("CACHE_BUCKET is not configured");
 }
 
+// `wrangler r2 bucket list` has no JSON output. Each bucket is printed as a
+// labelled block containing the line `name:  <bucket>`, so match that line
+// exactly instead of searching for a substring of some other bucket's name.
+export function bucketListed(output: string, name: string): boolean {
+  return stripVTControlCharacters(output)
+    .split(/\r?\n/)
+    .some((line) => /^\s*name:\s+(\S+)\s*$/.exec(line)?.[1] === name);
+}
+
+export async function bucketExists(
+  name: string,
+  config: string,
+): Promise<boolean> {
+  const listed = await wrangler(
+    ["r2", "bucket", "list"],
+    { quiet: true },
+    config,
+  );
+  return bucketListed(listed.stdout, name);
+}
+
 export async function ensureBucket(
   name: string,
   config: string,
 ): Promise<void> {
-  const listed = await wrangler(
-    ["r2", "bucket", "list"],
-    {
-      allowFailure: true,
-      quiet: true,
-    },
-    config,
-  );
-  if (listed.status === 0) {
-    try {
-      const parsed = JSON.parse(listed.stdout) as Array<{ name?: string }>;
-      if (parsed.some((bucket) => bucket.name === name)) return;
-    } catch {
-      // Wrangler versions have returned both JSON arrays and table output. The
-      // table output still gives us a safe substring check before creating.
-      if (listed.stdout.includes(name)) return;
-    }
-  }
+  if (await bucketExists(name, config)) return;
   const created = await wrangler(
     ["r2", "bucket", "create", name],
-    {
-      allowFailure: true,
-    },
+    { allowFailure: true },
     config,
   );
+  // Tolerate a concurrent creation of the same bucket by this account.
   if (
     created.status !== 0 &&
-    !/already exists|already been taken|exists/i.test(
-      `${created.stdout}\n${created.stderr}`,
-    )
-  ) {
+    !/already exists/i.test(`${created.stdout}\n${created.stderr}`)
+  )
     fail(`could not create R2 bucket ${name}`);
-  }
 }
 
-export async function ensureLifecycle(bucket: string): Promise<void> {
-  const listed = await wrangler(["r2", "bucket", "lifecycle", "list", bucket], {
-    allowFailure: true,
-    quiet: true,
-  });
+export async function ensureLifecycle(
+  bucket: string,
+  config: string,
+): Promise<void> {
+  const listed = await wrangler(
+    ["r2", "bucket", "lifecycle", "list", bucket],
+    { quiet: true },
+    config,
+  );
   const output = `${listed.stdout}\n${listed.stderr}`;
   if (!output.includes("abandoned-staging"))
-    await wrangler([
-      "r2",
-      "bucket",
-      "lifecycle",
-      "add",
-      bucket,
-      "abandoned-staging",
-      "staging/",
-      "--expire-days",
-      "1",
-      "--force",
-    ]);
+    await wrangler(
+      [
+        "r2",
+        "bucket",
+        "lifecycle",
+        "add",
+        bucket,
+        "abandoned-staging",
+        "staging/",
+        "--expire-days",
+        "1",
+        "--force",
+      ],
+      {},
+      config,
+    );
   if (!output.includes("abort-multipart"))
-    await wrangler([
-      "r2",
-      "bucket",
-      "lifecycle",
-      "add",
-      bucket,
-      "abort-multipart",
-      "",
-      "--abort-multipart-days",
-      "1",
-      "--force",
-    ]);
+    await wrangler(
+      [
+        "r2",
+        "bucket",
+        "lifecycle",
+        "add",
+        bucket,
+        "abort-multipart",
+        "",
+        "--abort-multipart-days",
+        "1",
+        "--force",
+      ],
+      {},
+      config,
+    );
 }
 
 export async function lifecycleIsConfigured(
   bucket: string,
+  config: string,
 ): Promise<boolean | undefined> {
-  const listed = await wrangler(["r2", "bucket", "lifecycle", "list", bucket], {
-    allowFailure: true,
-    quiet: true,
-  });
+  const listed = await wrangler(
+    ["r2", "bucket", "lifecycle", "list", bucket],
+    { allowFailure: true, quiet: true },
+    config,
+  );
   if (listed.status !== 0) return undefined;
   const output = `${listed.stdout}\n${listed.stderr}`;
   return (
@@ -442,15 +479,12 @@ export async function lifecycleIsConfigured(
   );
 }
 
-export function workerUrl(
-  config: TemplateConfig,
-  deploymentOutput = "",
-): string | undefined {
+export function workerUrl(deploymentOutput = ""): string | undefined {
   const configured = process.env.CF_NIX_CACHE_URL?.replace(/\/$/, "");
   if (configured) return configured;
-  const match = deploymentOutput.match(/https:\/\/[^\s'"`]+\.workers\.dev/);
-  if (match) return match[0];
-  return config.name ? `https://${config.name}.workers.dev` : undefined;
+  // A workers.dev hostname contains the account subdomain, which only the
+  // deployment output (or the operator, via CF_NIX_CACHE_URL) knows.
+  return deploymentOutput.match(/https:\/\/[^\s'"`]+\.workers\.dev/)?.[0];
 }
 
 export async function healthCheck(url: string | undefined): Promise<void> {
@@ -463,6 +497,6 @@ export async function healthCheck(url: string | undefined): Promise<void> {
 export function bootstrapCommand(url: string): string {
   return `curl -fsS '${url.replace(/\/$/, "")}/api/bootstrap' \\
   -H 'content-type: application/json' \\
-  -H 'Idempotency-Key: first-admin-$(date +%s)' \\
+  -H "Idempotency-Key: first-admin-$(date +%s)" \\
   --data '{"subject":"admin","valid_for_seconds":31536000,"grants":[{"cache":"*","role":"admin"}],"secret":"'"$CF_NIX_CACHE_BOOTSTRAP_SECRET"'"}'`;
 }
